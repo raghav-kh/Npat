@@ -16,8 +16,10 @@ from api.players import router as players_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Nothing to warm up yet in Phase 1. Once Alembic migrations are wired
-    # (Phase 2), this is where you'd optionally verify DB connectivity.
+    # Nothing to warm up yet - Postgres is only touched by REST endpoints
+    # (api/players.py) and, from Phase 3 onward, by game_manager writing
+    # completed rounds/results. Redis (room state) is connected lazily via
+    # database/redis_client.get_redis() on first use.
     yield
 
 
@@ -39,10 +41,11 @@ async def health():
     return {"status": "ok", "environment": settings.environment}
 
 
-# Importing socket.connection registers its @sio.event handlers as a
-# side effect. Socket.IO then wraps the FastAPI app: /socket.io/* is
-# handled by Socket.IO, every other path falls through to FastAPI.
-from sockets import connection  # noqa: E402,F401
+# Importing these registers their @sio.event / @sio.on handlers as a side
+# effect (connection.py: connect/disconnect; rooms.py: create_room/
+# join_room/leave_room). Socket.IO then wraps the FastAPI app: /socket.io/*
+# is handled by Socket.IO, every other path falls through to FastAPI.
+from sockets import connection, rooms  # noqa: E402,F401
 from sockets.server import build_combined_app  # noqa: E402
 
 # Uvicorn target
