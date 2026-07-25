@@ -166,8 +166,26 @@ ran real integration tests against it (not mocks):
 What I couldn't test: a real network-level Socket.IO client hitting a
 running server over an actual port — the sandbox doesn't keep background
 processes alive between tool calls, so that layer is worth a quick manual
-check on your end (e.g. with the Socket.IO client of your choice, or
-Postman's Socket.IO support) once you're running this locally.
+check on your end.
+
+**Update:** I did get this working within a single sandbox session (server
++ client in one shell invocation) and I'm glad I pushed for it — it caught
+a real bug the mocked handler test above had missed: `sio.enter_room()`
+and `sio.leave_room()` are coroutines on `AsyncServer` and need `await`.
+Without it, the calls silently no-op'd (Python just warns "coroutine was
+never awaited" rather than erroring), so a player's own room state in
+Redis was correct but they never actually joined the Socket.IO broadcast
+group — meaning `player_joined`/`player_left` would never have reached
+anyone in production. Fixed in `sockets/rooms.py`. This is exactly the
+kind of bug that a mocked-handler test can't catch (the mock silently
+accepted being called without awaiting), which is why I went back and
+insisted on a real server + real client run afterward — see
+`test_socket_flow.py`, included in this zip, which you can run yourself
+against your local server anytime with:
+```bash
+uvicorn main:asgi_app --reload    # terminal 1
+python test_socket_flow.py         # terminal 2
+```
 
 ## What's NOT here yet (later phases)
 - Letter shuffle, category selection, round lifecycle, locking (`services/`)

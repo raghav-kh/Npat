@@ -40,7 +40,7 @@ async def handle_create_room(sid, data):
     room_code = await room_manager.create_room(
         sid, payload.player_id, payload.username, payload.avatar_config.model_dump()
     )
-    sio.enter_room(sid, room_code)
+    await sio.enter_room(sid, room_code)
 
     state = await room_manager.get_room_state(room_code)
     await sio.emit("room_created", state, to=sid)
@@ -73,7 +73,7 @@ async def handle_join_room(sid, data):
         )
         return
 
-    sio.enter_room(sid, room_code)
+    await sio.enter_room(sid, room_code)
 
     # Broadcast to the whole room (including the joiner) - this single
     # event both confirms the join to the new player and updates
@@ -97,7 +97,7 @@ async def handle_departure(sid: str) -> None:
         return
 
     room_code = result["room_code"]
-    sio.leave_room(sid, room_code)
+    await sio.leave_room(sid, room_code)
 
     if result["room_deleted"]:
         logger.info("Room %s deleted (last player left)", room_code)
