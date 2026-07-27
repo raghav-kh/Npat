@@ -43,9 +43,11 @@ async def health():
 
 # Importing these registers their @sio.event / @sio.on handlers as a side
 # effect (connection.py: connect/disconnect; rooms.py: create_room/
-# join_room/leave_room). Socket.IO then wraps the FastAPI app: /socket.io/*
-# is handled by Socket.IO, every other path falls through to FastAPI.
-from sockets import connection, rooms  # noqa: E402,F401
+# join_room/leave_room; gameplay.py: start_game/submit_answers/
+# player_done/next_round). Socket.IO then wraps the FastAPI app:
+# /socket.io/* is handled by Socket.IO, every other path falls through to
+# FastAPI.
+from sockets import connection, gameplay, rooms  # noqa: E402,F401
 from sockets.server import build_combined_app  # noqa: E402
 
 # Uvicorn target

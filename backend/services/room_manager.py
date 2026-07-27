@@ -224,3 +224,35 @@ async def is_host(room_code: str, player_id: str) -> bool:
     r = get_redis()
     host_id = await r.hget(_room_key(room_code), "host_player_id")
     return host_id == player_id
+
+
+async def set_room_status(room_code: str, status: str) -> None:
+    """status is one of: lobby | in_progress | finished - matches RoomStatus."""
+    r = get_redis()
+    await r.hset(_room_key(room_code), "status", status)
+
+
+async def set_player_status(room_code: str, player_id: str, status: str) -> None:
+    """status is one of: idle | typing | done - matches PlayerPublicState.status."""
+    r = get_redis()
+    raw = await r.hget(_players_key(room_code), player_id)
+    if raw is None:
+        return
+    data = json.loads(raw)
+    data["status"] = status
+    await r.hset(_players_key(room_code), player_id, json.dumps(data))
+
+
+async def reset_all_player_statuses(room_code: str, status: str) -> None:
+    """Called at the start of each new round to clear everyone's status
+    back to idle."""
+    r = get_redis()
+    players_raw = await r.hgetall(_players_key(room_code))
+    if not players_raw:
+        return
+    pipe = r.pipeline()
+    for pid, raw in players_raw.items():
+        data = json.loads(raw)
+        data["status"] = status
+        pipe.hset(_players_key(room_code), pid, json.dumps(data))
+    await pipe.execute()

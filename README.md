@@ -1,11 +1,14 @@
-# NPAT Backend — Phases 1 & 2: Foundation + Room Manager
+# NPAT Backend — Phases 1, 2 & 3: Foundation + Rooms + Game Engine
 
 Real-time multiplayer Name-Place-Animal-Thing backend.
 - **Phase 1** laid the foundation: project structure, config, DB models,
   Pydantic schemas, and a working FastAPI + Socket.IO app.
-- **Phase 2** (this update) adds the room lifecycle: create/join/leave a
-  room in real time, backed by Redis, with a full automated test suite
-  run against a real Redis instance (details below).
+- **Phase 2** added the room lifecycle: create/join/leave a room in real
+  time, backed by Redis.
+- **Phase 3** (this update) adds the actual game engine: letter shuffle,
+  category selection, round lifecycle, and immediate locking on the first
+  player's Done — tested against a real local Postgres + Redis + running
+  server, not mocks (details below).
 
 ## What's in these phases
 
@@ -14,6 +17,7 @@ backend/
 ├── main.py                  # FastAPI + Socket.IO combined ASGI entrypoint
 ├── config.py                 # Settings (env-driven), incl. scoring/game tuning
 ├── requirements.txt
+├── requirements-dev.txt       # only for test_connection.py / test_socket_flow.py
 ├── .env.example               # copy to .env and fill in
 ├── alembic/                   # migrations (async, autogenerate wired to models)
 ├── database/
@@ -26,34 +30,45 @@ backend/
 ├── schemas/                   # Pydantic request/response models
 │   ├── player.py
 │   ├── room.py
-│   ├── round.py
-│   └── socket_events.py         # NEW: validates create_room/join_room/leave_room payloads
-├── services/                  # NEW: game logic, independent of the transport layer
-│   └── room_manager.py          # Redis-backed room/player state - the source of truth
+│   ├── round.py                 # UPDATED: player_done can now carry final answers
+│   └── socket_events.py
+├── services/                  # game logic, independent of the transport layer
+│   ├── room_manager.py          # Redis-backed room/player state
+│   ├── letter_generator.py      # NEW: shuffles all 26 letters once per game
+│   ├── category_selector.py     # NEW: picks 4-5 random categories per round
+│   └── game_manager.py          # NEW: round lifecycle orchestrator - the core of Phase 3
 ├── api/
 │   └── players.py              # POST/GET /api/players (create + fetch profile)
-└── sockets/                   # (named `sockets`, NOT `socket` — see note below)
+└── sockets/
     ├── server.py                # AsyncServer + Redis-backed manager
     ├── connection.py            # connect/disconnect - disconnect delegates to rooms.handle_departure
-    └── rooms.py                 # NEW: create_room / join_room / leave_room event handlers
+    ├── rooms.py                 # create_room / join_room / leave_room event handlers
+    └── gameplay.py               # NEW: start_game / submit_answers / player_done / next_round
 ```
 
-### What Phase 2 actually does
-- `create_room` — generates a 5-character room code (ambiguous characters
-  like `O`/`0`, `I`/`1` excluded), makes the creator host, replies with
-  `room_created`.
-- `join_room` — validates the room exists, isn't full, and hasn't started;
-  broadcasts `player_joined` (full room state) to everyone including the
-  joiner. Rejoining with the same `player_id` (e.g. a page refresh) is
-  treated as a reconnect — it updates their socket id in place rather than
-  duplicating them or resetting their score.
-- `leave_room` (explicit) and an abrupt disconnect both route through the
-  same `room_manager.leave_room_by_sid` cleanup — whichever way a player
-  leaves, the room state ends up consistent. If the host leaves, another
-  player is promoted; if the room empties out, it's deleted from Redis.
-- Bad payloads (missing username, etc.) get a clean `error` event with a
-  specific message instead of a crash — every handler validates through
-  `schemas/socket_events.py` first.
+### What Phase 3 actually does
+- `start_game` (host only) — shuffles all 26 letters, flips the room to
+  `in_progress`, deals round 1.
+- Each round: server picks the next letter off the shuffled queue and
+  4-5 random categories from the pool.
+- `submit_answers` — a player's draft answers, saved to Redis. Callable
+  any number of times before the round locks; not broadcast to other
+  players (only the eventual locked reveal is).
+- `player_done` — **locks the round immediately for everyone**, no grace
+  period, matching the spec exactly (an explicit choice confirmed before
+  this phase started). Whatever each player had saved via
+  `submit_answers` (or passes directly with their Done) becomes their
+  frozen submission; anyone who submitted nothing gets blank answers. The
+  locked round and every answer get written to Postgres at this point,
+  with status `PENDING` (or `BLANK`) — no validation or scoring yet,
+  that's Phase 4/5.
+- `next_round` (host only, **not** in the original spec's event list —
+  added because the automatic advance-after-stats flow depends on Phase
+  5's achievement engine, which doesn't exist yet) — deals the next
+  letter, or emits `game_finished` once all 26 have been used.
+- Trying to join a room after it's started, submit/Done after a round is
+  already locked, or a non-host trying to start/advance the game all
+  produce a clean `error` event rather than corrupting state.
 
 ### Why no auth
 Per the spec, players are just `username + avatar`, stored client-side
@@ -68,12 +83,28 @@ if you add files here later.
 
 ### State split: Postgres vs Redis
 - **Postgres** (`models/`) is the system of record: players, completed
-  rounds/answers, final results. Written at checkpoints, not on every event.
-- **Redis** (`services/room_manager.py`) holds live, fast-changing state:
-  who's in a room right now, host status, reconnect handling. Round
-  timers, who's typing, and locked-but-not-yet-persisted answers land in
-  Phase 3. This is also why Socket.IO uses `AsyncRedisManager` — it lets
-  events fan out correctly even across multiple backend worker processes.
+  rounds/answers, final results. Written at checkpoints — specifically,
+  the instant a round locks — not on every event.
+- **Redis** (`services/room_manager.py`, `services/game_manager.py`) holds
+  live, fast-changing state: who's in a room, host status, the current
+  letter/categories, draft answers before a round locks. This is also why
+  Socket.IO uses `AsyncRedisManager` — it lets events fan out correctly
+  even across multiple backend worker processes.
+
+### A design tradeoff worth knowing about
+`Room.host_player_id` in Postgres has a real foreign-key constraint to
+`players.id` (see `models/game.py`). This means a room's first Postgres
+row (written at first-round-lock time — Phase 2's room creation stays
+Redis-only) requires the host to have actually gone through
+`POST /api/players` first. If a client ever sent game events with a
+`player_id` Postgres doesn't know about, that DB write would fail — I
+caught this during testing (details below) and made a deliberate choice:
+**a Postgres persistence failure is logged, not raised.** The round stays
+locked and playable in Redis regardless, because from a player's chair,
+a round that never resolves is worse than a round whose data silently
+didn't get saved. Worth knowing if you ever see a
+"Failed to persist round... to Postgres" warning in your logs — it means
+gameplay kept going, but that round's history didn't get saved.
 
 ## Setup (Supabase + Upstash — no Docker needed)
 
@@ -138,57 +169,51 @@ passes against SQLite as a stand-in) — but I don't have network access to
 your actual Supabase/Upstash instances from here, so `alembic upgrade
 head` and the curl checks above are on you to run for real.
 
-## How Phase 2 was tested
+## How this was tested
 
-I don't have your actual Supabase/Upstash credentials, but Redis itself
-doesn't need them — it's the same protocol everywhere. So instead of
-skipping testing, I installed a local `redis-server` in the sandbox and
-ran real integration tests against it (not mocks):
+**Phase 2** (rooms): I installed a local `redis-server` in the sandbox and
+ran real integration tests against it — full room lifecycle (create, join,
+reconnect, fill to capacity, host leaves, last player leaves), then the
+actual Socket.IO handlers with a real server + real client. That caught a
+real bug: `sio.enter_room()`/`sio.leave_room()` are coroutines on
+`AsyncServer` and need `await` — without it, the calls silently no-op'd
+(Python just warns rather than erroring), so a player's Redis state was
+correct but they never actually joined the Socket.IO broadcast group.
+Fixed in `sockets/rooms.py`.
 
-1. **`services/room_manager.py`** — a full scenario end-to-end: create a
-   room, join a second player, reconnect that same player (confirmed no
-   duplicate), fill the room to `MAX_PLAYERS_PER_ROOM` and confirm the
-   next join raises `RoomFull`, confirm joining a nonexistent code raises
-   `RoomNotFound`, have the host leave and confirm another player is
-   promoted, then have everyone leave and confirm the room is deleted
-   from Redis. All passed.
-2. **`sockets/rooms.py`** — called the actual event handlers (not
-   `room_manager` directly) with `sio.emit`/`enter_room`/`leave_room`
-   mocked, to check the Socket.IO-specific wiring: correct events fire,
-   `player_joined` broadcasts to the whole room, a malformed payload
-   produces a clean `error` event instead of a crash, and disconnect
-   cleanup produces the right `player_left` payload.
-3. **`main.py`** — booted the full app (via `TestClient`, SQLite standing
-   in for Postgres, real local Redis) and confirmed all five handlers
-   (`create_room`, `join_room`, `leave_room`, `connect`, `disconnect`)
-   are actually registered on the Socket.IO server.
+**Phase 3** (game engine): this time I installed a local **Postgres**
+too, since round-locking actually writes to it. Ran real migrations
+against it, then played a full game through **real REST calls + real
+Socket.IO clients** end-to-end: created two real players via
+`POST /api/players`, created/joined a room, `start_game`, one player
+saving a draft via `submit_answers`, the other pressing Done with answers
+bundled directly, confirmed the round locked immediately (no grace
+period) with both players' answers correctly captured, advanced to round
+2 with a new letter/categories, and confirmed a non-host is rejected from
+advancing the round. Then queried Postgres directly to confirm what
+actually landed there — not just what the socket events claimed.
 
-What I couldn't test: a real network-level Socket.IO client hitting a
-running server over an actual port — the sandbox doesn't keep background
-processes alive between tool calls, so that layer is worth a quick manual
-check on your end.
+That last step caught a real bug: the persisted `Room.host_player_id` was
+wrong (it was picking an arbitrary player from a dict instead of asking
+who the actual host was — confirmed by the DB literally showing the
+guest's ID as host). Fixed to pass the real host id through explicitly.
+It also surfaced the FK-constraint/persistence-failure tradeoff described
+above, which led to the "log, don't raise" decision in `player_done`.
 
-**Update:** I did get this working within a single sandbox session (server
-+ client in one shell invocation) and I'm glad I pushed for it — it caught
-a real bug the mocked handler test above had missed: `sio.enter_room()`
-and `sio.leave_room()` are coroutines on `AsyncServer` and need `await`.
-Without it, the calls silently no-op'd (Python just warns "coroutine was
-never awaited" rather than erroring), so a player's own room state in
-Redis was correct but they never actually joined the Socket.IO broadcast
-group — meaning `player_joined`/`player_left` would never have reached
-anyone in production. Fixed in `sockets/rooms.py`. This is exactly the
-kind of bug that a mocked-handler test can't catch (the mock silently
-accepted being called without awaiting), which is why I went back and
-insisted on a real server + real client run afterward — see
-`test_socket_flow.py`, included in this zip, which you can run yourself
-against your local server anytime with:
-```bash
-uvicorn main:asgi_app --reload    # terminal 1
-python test_socket_flow.py         # terminal 2
-```
+I also directly tested the edge cases hardest to hit by playing an entire
+26-round game manually: the letter queue reaching empty (`game_finished`
+path, and confirmed calling `next_round` again afterward doesn't error),
+late joins being rejected once a game has started, double-`start_game`
+being rejected, and `submit_answers`/`player_done` both being correctly
+rejected once a round is already locked.
+
+What I couldn't test: a client actually typing into a UI and clicking
+buttons — there's no frontend yet. Everything above was driven by
+scripted REST/socket calls, which covers the server's correctness but not
+things like network latency handling or UI-side state management once
+the frontend exists.
 
 ## What's NOT here yet (later phases)
-- Letter shuffle, category selection, round lifecycle, locking (`services/`)
 - Local dataset + Groq challenge validation (`services/validator.py`)
 - Scoring + duplicate detection + achievement engine
 - Avatar SVG generation (`services/avatar_service.py`)

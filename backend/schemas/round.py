@@ -22,6 +22,10 @@ class SubmitAnswersRequest(BaseModel):
 class PlayerDoneRequest(BaseModel):
     player_id: str
     room_code: str
+    # Optional: a player's final answers, submitted at the same moment as
+    # Done rather than via a separate submit_answers call beforehand. If
+    # omitted, whatever they last sent via submit_answers is used instead.
+    answers: list[AnswerSubmit] | None = None
 
 
 class ChallengeRequest(BaseModel):

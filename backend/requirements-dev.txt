@@ -1,0 +1,6 @@
+# Only needed to run test_connection.py / test_socket_flow.py - NOT
+# required by the server itself (main.py). Install with:
+#   pip install -r requirements-dev.txt
+
+requests==2.33.1
+websocket-client==1.8.0
